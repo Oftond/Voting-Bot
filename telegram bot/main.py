@@ -1,9 +1,9 @@
-import asyncio
-from bothandler import bothandler
+# import asyncio
+# from bothandler import bothandler
 
-async def main():
-    bot = bothandler()
-    await bot.run()
+# async def main():
+#     bot = bothandler()
+#     await bot.run()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# if __name__ == "__main__":
+#     asyncio.run(main())
