@@ -1,4 +1,0 @@
-aiogram
-asyncio
-asyncpg
-dotenv
