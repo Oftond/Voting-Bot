@@ -1,6 +1,4 @@
-from logging import config
 import os
-from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -8,11 +6,10 @@ from aiogram.fsm.state import StatesGroup, State
 from keyboard import keyboard
 from logger import logger
 from datetime import datetime, timedelta
+import config
 import asyncpg
 import sys
 
-# Load environment variables from the .env file
-load_dotenv()
 
 class bothandler:
     class PollCreation(StatesGroup):
@@ -166,6 +163,7 @@ class bothandler:
 
     async def handle_confirm_management(self, message: types.Message, state: FSMContext):
         """Обработка подтверждения действия"""
+        logger.log_message(message)
         data = await state.get_data()
         poll_id = data.get('poll_id')
         user_id = message.from_user.id
@@ -176,19 +174,35 @@ class bothandler:
             await state.clear()
             return
 
-        poll = await self.fetch_poll(poll_id)
+        poll = self.active_polls.get(poll_id)
 
+        # Дополнительная проверка прав (на случай, если state был изменен)
         if not poll:
             await message.answer("Голосование не найдено")
         elif not is_admin and poll['creator_id'] != user_id:
             await message.answer("❌ Нет прав для управления этим голосованием")
         else:
             if message.text == "Удалить":
-                await self.delete_poll(poll_id)
-                await message.answer(f"Голосование #{poll_id} полностью удалено.", reply_markup=keyboard.get_start_keyboard())
+                # Полное удаление голосования
+                del self.active_polls[poll_id]
+                await message.answer(
+                    f"Голосование #{poll_id} полностью удалено.",
+                    reply_markup=keyboard.get_start_keyboard()
+                )
             elif message.text == "Завершить":
-                await self.end_poll(poll_id)
-                await message.answer(f"Голосование #{poll_id} завершено.", reply_markup=keyboard.get_start_keyboard())
+                if datetime.now() > poll['end_time']:
+                    await message.answer("Это голосование уже завершено")
+                else:
+                    # Завершаем голосование и сохраняем в архив
+                    poll['end_time'] = datetime.now()
+                    self.archived_polls[poll_id] = poll
+                    del self.active_polls[poll_id]
+                    await message.answer(
+                        f"✅ Голосование #{poll_id} завершено.\n"
+                        f"Название: {poll['title']}\n"
+                        f"Статистика сохранена.",
+                        reply_markup=keyboard.get_start_keyboard()
+                    )
             elif message.text == "Отмена":
                 await message.answer("Действие отменено", reply_markup=keyboard.get_start_keyboard())
 
@@ -351,14 +365,39 @@ class bothandler:
         await self.show_main_menu(message)
 
     async def handle_statistika(self, message: types.Message):
-        if not self.active_polls:
-            await message.answer("Активных голосований нет.")
+        logger.log_message(message)
+
+        all_polls = {**self.active_polls, **self.archived_polls}
+
+        if not all_polls:
+            await message.answer("Нет доступных голосований.")
             return
 
         response = "📊 Статистика голосований:\n\n"
-        for poll in self.active_polls:
-            total_votes = await self.count_votes(poll['id'])
-            response += f"Голосование ID: {poll['id']}, Всего голосов: {total_votes}\n"
+
+        for poll_id, poll in all_polls.items():
+            total_votes = sum(poll['votes'].values())
+            end_time = poll['end_time']
+            status = "🟢 Активно" if poll_id in self.active_polls else "🔴 Завершено"
+
+            if total_votes > 0:
+                options_stats = "\n".join(
+                    f"  • {option}: {votes} ({votes / total_votes * 100:.1f}%)"
+                    for option, votes in poll['votes'].items()
+                )
+            else:
+                options_stats = "\n".join(
+                    f"  • {option}: {votes} (0%)"
+                    for option, votes in poll['votes'].items()
+                )
+
+            response += (
+                f"📌 #{poll_id}: {poll['title']}\n"
+                f"Статус: {status}\n"
+                f"Завершено: {end_time.strftime('%d.%m.%Y %H:%M')}\n"
+                f"Всего голосов: {total_votes}\n"
+                f"{options_stats}\n\n"
+            )
 
         await message.answer(response)
         await self.show_main_menu(message)
