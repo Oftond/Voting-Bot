@@ -3,6 +3,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram import BaseMiddleware
 from keyboard import keyboard
 from logger import logger
 from datetime import datetime, timedelta
@@ -10,6 +11,19 @@ import config
 import asyncpg
 import sys
 
+class UserMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        # Для сообщений
+        if isinstance(event, types.Message):
+            user_id = event.from_user.id
+            data['user_id'] = user_id
+        
+        # Для callback-запросов (если нужно)
+        elif isinstance(event, types.CallbackQuery):
+            user_id = event.from_user.id
+            data['user_id'] = user_id
+            
+        return await handler(event, data)
 
 class bothandler:
     class PollCreation(StatesGroup):
@@ -60,6 +74,8 @@ class bothandler:
         await self.pool.close()
 
     def _register_handlers(self):
+        self.dp.message.middleware.register(UserMiddleware())  # Регистрация middleware
+
         self.dp.message.register(self.cmd_start, Command("start"))
         self.dp.message.register(self.handle_delete, F.text == "Удалить/Завершить голосование")
         self.dp.message.register(self.handle_create_poll, F.text == "Создать голосование")
@@ -89,6 +105,9 @@ class bothandler:
 
     async def handle_vote(self, message: types.Message, state: FSMContext):
         """Обработка кнопки 'Проголосовать'"""
+        data = await state.get_data()
+        user_id = data.get('user_id')  # Получаем ID пользователя
+
         poll_list = await self.fetch_active_polls()
         if not poll_list:
             await message.answer("⏳ Сейчас нет активных голосований.")
@@ -110,7 +129,9 @@ class bothandler:
 
     async def handle_delete(self, message: types.Message, state: FSMContext):
         """Обработка кнопки 'Удалить/Завершить голосование'"""
-        user_id = message.from_user.id
+        data = await state.get_data()
+        user_id = data.get('user_id')  # Получаем ID пользователя
+
         polls_to_show = await self.fetch_user_polls(user_id)
         
         if not polls_to_show:
@@ -131,7 +152,7 @@ class bothandler:
     async def handle_choose_poll_to_manage(self, message: types.Message, state: FSMContext):
         """Обработка выбора голосования для управления"""
         data = await state.get_data()
-        user_id = message.from_user.id
+        user_id = data.get('user_id')  # Получаем ID пользователя
         is_admin = data.get('is_admin', False)
 
         try:
@@ -166,7 +187,7 @@ class bothandler:
         logger.log_message(message)
         data = await state.get_data()
         poll_id = data.get('poll_id')
-        user_id = message.from_user.id
+        user_id = data.get('user_id')  # Получаем ID пользователя
         is_admin = data.get('is_admin', False)
 
         if not poll_id:
@@ -176,7 +197,6 @@ class bothandler:
 
         poll = self.active_polls.get(poll_id)
 
-        # Дополнительная проверка прав (на случай, если state был изменен)
         if not poll:
             await message.answer("Голосование не найдено")
         elif not is_admin and poll['creator_id'] != user_id:
@@ -188,6 +208,7 @@ class bothandler:
                 await message.answer(
                     f"Голосование #{poll_id} полностью удалено.",
                     reply_markup=keyboard.get_start_keyboard()
+
                 )
             elif message.text == "Завершить":
                 if datetime.now() > poll['end_time']:
@@ -283,6 +304,9 @@ class bothandler:
         end_time = datetime.now() + timedelta(hours=duration)
 
         async with self.pool.acquire() as conn:
+            # Здесь сохраняем или обновляем пользователя в таблице
+            await self.upsert_user(user_id, username)
+
             poll_id = await conn.fetchval(
                 '''
                 INSERT INTO polls (title, creator_id, end_time, is_active)
@@ -292,9 +316,6 @@ class bothandler:
                 user_id,                 # Telegram ID пользователя
                 end_time                 # Время окончания голосования
             )
-            
-            # Здесь сохраняем или обновляем пользователя в таблице
-            await self.upsert_user(user_id, username)
 
             await message.answer(
                 f"✅ Голосование создано!\n"
@@ -307,6 +328,10 @@ class bothandler:
             await state.clear()
 
     async def handle_choose_poll(self, message: types.Message, state: FSMContext):
+        """Обработка выбора голосования"""
+        data = await state.get_data()
+        user_id = data.get('user_id')  # Получаем ID пользователя
+
         try:
             poll_id = int(message.text)
             poll = await self.fetch_poll(poll_id)
@@ -352,8 +377,8 @@ class bothandler:
                 ON CONFLICT (poll_id, user_id) DO NOTHING
                 ''',
                 poll_id,
-                message.from_user.id,
-                message.text
+                message.from_user.id,     # Используем ID из message
+                message.text               # Можно также добавить option_id, если это необходимо
             )
 
         await message.answer(f"✅ Спасибо! Ваш голос '{message.text}' засчитан.", reply_markup=keyboard.get_start_keyboard())
