@@ -13,16 +13,12 @@ import sys
 
 class UserMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        # Для сообщений
         if isinstance(event, types.Message):
             user_id = event.from_user.id
             data['user_id'] = user_id
-        
-        # Для callback-запросов (если нужно)
         elif isinstance(event, types.CallbackQuery):
             user_id = event.from_user.id
             data['user_id'] = user_id
-            
         return await handler(event, data)
 
 class bothandler:
@@ -61,13 +57,17 @@ class bothandler:
 
     async def init_db(self):
         """Инициализирует пул соединений с PostgreSQL."""
-        self.pool = await asyncpg.create_pool(
-            user=self.DB_USER,
-            password=self.DB_PASSWORD,
-            database=self.DB_NAME,
-            host=self.DB_HOST,
-            port=self.DB_PORT
-        )
+        try:
+            self.pool = await asyncpg.create_pool(
+                user=self.DB_USER,
+                password=self.DB_PASSWORD,
+                database=self.DB_NAME,
+                host=self.DB_HOST,
+                port=self.DB_PORT)
+            print("Successfully initialized DB")
+        except Exception as e:
+            print(f"Database initialization failed: {e}")
+            sys.exit(1)
 
     async def close_db(self):
         """Закрывает пул соединений с PostgreSQL."""
@@ -104,35 +104,37 @@ class bothandler:
         await self.show_main_menu(message)
 
     async def handle_vote(self, message: types.Message, state: FSMContext):
-        """Обработка кнопки 'Проголосовать'"""
-        data = await state.get_data()
-        user_id = data.get('user_id')  # Получаем ID пользователя
-
-        poll_list = await self.fetch_active_polls()
-        if not poll_list:
-            await message.answer("⏳ Сейчас нет активных голосований.")
+        active_polls = await self.fetch_active_polls()
+        if not active_polls:
+            await message.answer("⏳ Нет активных голосований.")
             return
 
-        polls_list = "\n".join(
-            f"ID: {poll['id']} - {poll['title']} (до {poll['end_time']})"
-            for poll in poll_list
-        )
-        await message.answer(
-            f"📝 Выберите ID голосования:\n\n{polls_list}",
-            reply_markup=keyboard.get_cancel_keyboard()
-        )
+        # Correctly construct the polls list for the user
+        polls_list = "\n".join(f"ID: {poll['id']} - {poll['title']}" for poll in active_polls)
+        await message.answer(f"📝 Доступные голосования:\n\n{polls_list}", reply_markup=keyboard.get_cancel_keyboard())
         await state.set_state(self.Voting.choosing_poll)
 
-    async def fetch_active_polls(self):
+        polls_list = "\n".join(f"ID: {poll['id']} - {poll['title']}" for poll in active_polls)
+        await message.answer(f"📝 Доступные голосования:\n\n{polls_list}", reply_markup=keyboard.get_cancel_keyboard())
+        await state.set_state(self.Voting.choosing_poll)
+
+    async def fetch_active_polls(self, user_id=None):
+        query = "SELECT * FROM polls WHERE is_active = TRUE AND end_time > NOW()"
+        if user_id:  # Filter by user if provided
+            query = f"SELECT * FROM polls WHERE is_active = TRUE AND end_time > NOW() AND creator_id = {user_id}"
         async with self.pool.acquire() as conn:
-            return await conn.fetch("SELECT * FROM polls WHERE is_active = TRUE AND end_time > NOW()")
+            try:
+                return await conn.fetch(query)
+            except Exception as e:
+                print(f"Error fetching active polls: {e}")
+                return []
 
     async def handle_delete(self, message: types.Message, state: FSMContext):
         """Обработка кнопки 'Удалить/Завершить голосование'"""
         data = await state.get_data()
         user_id = data.get('user_id')  # Получаем ID пользователя
 
-        polls_to_show = await self.fetch_user_polls(user_id)
+        polls_to_show = await self.fetch_active_polls(user_id=user_id)
         
         if not polls_to_show:
             await message.answer("Нет доступных голосований для управления.")
@@ -147,91 +149,127 @@ class bothandler:
 
     async def fetch_user_polls(self, user_id):
         async with self.pool.acquire() as conn:
-            return await conn.fetch("SELECT * FROM polls WHERE creator_id = $1", user_id)
+            try:
+              return await conn.fetch("SELECT * FROM polls WHERE creator_id = $1", user_id)
+            except Exception as e:
+                print(f"Error fetching user polls: {e}")
+                return []
 
     async def handle_choose_poll_to_manage(self, message: types.Message, state: FSMContext):
         """Обработка выбора голосования для управления"""
         data = await state.get_data()
         user_id = data.get('user_id')  # Получаем ID пользователя
-        is_admin = data.get('is_admin', False)
 
         try:
-            poll_id = int(message.text)
+            poll_id = int(message.text)  # Получаем ID голосования из текста сообщения
+
+            if poll_id <= 0:
+                await message.answer("Некорректный ID голосования.")
+                return
+                
+            # Запрашиваем информацию о голосовании
             poll = await self.fetch_poll(poll_id)
 
             if not poll:
-                raise ValueError("Голосование не найдено")
-            if not is_admin and poll['creator_id'] != user_id:
-                raise ValueError("Нет прав для управления этим голосованием")
+                await message.answer("Голосование не найдено.")
+                return
+                
+            # Сохраняем creator_id для дальнейшей проверки прав
+            creator_id = poll['creator_id']
+            if creator_id != user_id:  # Проверка прав на управление
+                await message.answer("❌ У вас нет прав на управление этим голосованием.")
+                await state.clear()
+                return
 
+            # Определяем статус голосования
             status_msg = "🔴 Голосование уже завершено" if not poll['is_active'] else "🟢 Голосование активно"
 
+            # Отправляем пользователю информацию о голосовании и статусе
             await message.answer(
                 f"Голосование #{poll_id}: {poll['title']}\n{status_msg}\nВыберите действие:",
-                reply_markup=keyboard.get_confirm_keyboard()
+                reply_markup=keyboard.get_confirm_keyboard()  # Отправляем клавиатуру действия
             )
 
-            await state.update_data(poll_id=poll_id)
-            await state.set_state(self.PollManagement.confirm_action)
+            # Сохраняем poll_id и creator_id в состоянии для дальнейшего использования
+            await state.update_data(poll_id=poll_id, creator_id=creator_id)  
+            await state.set_state(self.PollManagement.confirm_action)  # Выставляем состояние для подтверждения действия
 
         except ValueError as e:
             await message.answer(f"Ошибка: {str(e)}")
             await state.clear()
-
-    async def fetch_poll(self, poll_id):
-        async with self.pool.acquire() as conn:
-            return await conn.fetchrow("SELECT * FROM polls WHERE id = $1", poll_id)
-
+            
     async def handle_confirm_management(self, message: types.Message, state: FSMContext):
         """Обработка подтверждения действия"""
         logger.log_message(message)
         data = await state.get_data()
         poll_id = data.get('poll_id')
-        user_id = data.get('user_id')  # Получаем ID пользователя
-        is_admin = data.get('is_admin', False)
 
         if not poll_id:
-            await message.answer("Ошибка: голосование не выбрано")
+            await message.answer("Ошибка: голосование не выбрано.")
             await state.clear()
             return
 
-        poll = self.active_polls.get(poll_id)
+        try:
+            poll = await self.fetch_poll(poll_id)
 
-        if not poll:
-            await message.answer("Голосование не найдено")
-        elif not is_admin and poll['creator_id'] != user_id:
-            await message.answer("❌ Нет прав для управления этим голосованием")
-        else:
+            if not poll:
+                await message.answer("Голосование не найдено.")
+                await state.clear()
+                return
+
+            # Теперь мы не проверяем права доступа
             if message.text == "Удалить":
-                # Полное удаление голосования
-                del self.active_polls[poll_id]
+                await self.delete_poll(poll_id)  # Удаление из БД
                 await message.answer(
-                    f"Голосование #{poll_id} полностью удалено.",
+                    f"Голосование #{poll_id} удалено.",
                     reply_markup=keyboard.get_start_keyboard()
-
                 )
+
             elif message.text == "Завершить":
                 if datetime.now() > poll['end_time']:
-                    await message.answer("Это голосование уже завершено")
-                else:
-                    # Завершаем голосование и сохраняем в архив
-                    poll['end_time'] = datetime.now()
-                    self.archived_polls[poll_id] = poll
-                    del self.active_polls[poll_id]
-                    await message.answer(
-                        f"✅ Голосование #{poll_id} завершено.\n"
-                        f"Название: {poll['title']}\n"
-                        f"Статистика сохранена.",
-                        reply_markup=keyboard.get_start_keyboard()
-                    )
-            elif message.text == "Отмена":
-                await message.answer("Действие отменено", reply_markup=keyboard.get_start_keyboard())
+                    await message.answer("Это голосование уже завершено.")
+                    await state.clear()
+                    return
+                
+                # Завершаем голосование и сохраняем в архив
+                await self.end_poll(poll_id)  # Завершение в БД
 
-        await state.clear()
+                # Важно: Добавьте обработку статистики, если требуется
+                await message.answer(
+                    f"✅ Голосование #{poll_id} завершено.\n"
+                    f"Название: {poll['title']}",
+                    reply_markup=keyboard.get_start_keyboard()
+                )
+
+            elif message.text == "Отмена":
+                await message.answer("Действие отменено.", reply_markup=keyboard.get_start_keyboard())
+            
+            else:
+                await message.answer("Неизвестная команда.")
+
+            await state.clear()
+
+        except (ValueError, KeyError) as e:
+            await message.answer(f"Ошибка: {e}")
+            await state.clear()
 
     async def delete_poll(self, poll_id):
         async with self.pool.acquire() as conn:
-            await conn.execute("DELETE FROM polls WHERE id = $1", poll_id)
+            try:
+                await conn.execute("DELETE FROM polls WHERE id = $1", poll_id)
+                await conn.execute("DELETE FROM poll_options WHERE poll_id = $1", poll_id)  # Важно!
+                await conn.execute("DELETE FROM votes WHERE poll_id = $1", poll_id)  # Важно!
+                print(f"Голосование {poll_id} удалено из БД.")
+            except Exception as e:
+                print(f"Ошибка при удалении голосования из БД: {e}")
+
+    async def end_poll(self, poll_id):
+        async with self.pool.acquire() as conn:
+            try:
+                await conn.execute("UPDATE polls SET is_active = FALSE WHERE id = $1", poll_id)
+                print(f"Голосование {poll_id} завершено в БД.")
+            except Exception as e:
+                print(f"Ошибка при завершении голосования в БД: {e}")
 
     async def end_poll(self, poll_id):
         async with self.pool.acquire() as conn:
@@ -307,15 +345,27 @@ class bothandler:
             # Здесь сохраняем или обновляем пользователя в таблице
             await self.upsert_user(user_id, username)
 
+            # Сохраняем опрос
             poll_id = await conn.fetchval(
                 '''
                 INSERT INTO polls (title, creator_id, end_time, is_active)
                 VALUES ($1, $2, $3, TRUE) RETURNING id
                 ''',
-                poll_data['title'],      # Название голосования
-                user_id,                 # Telegram ID пользователя
-                end_time                 # Время окончания голосования
+                poll_data['title'],
+                user_id,
+                end_time
             )
+
+            # Сохраняем варианты опроса
+            for option in poll_data['options']:
+                await conn.execute(
+                    '''
+                    INSERT INTO poll_options (poll_id, option_text) 
+                    VALUES ($1, $2)
+                    ''',
+                    poll_id,
+                    option
+                )
 
             await message.answer(
                 f"✅ Голосование создано!\n"
@@ -328,60 +378,107 @@ class bothandler:
             await state.clear()
 
     async def handle_choose_poll(self, message: types.Message, state: FSMContext):
-        """Обработка выбора голосования"""
-        data = await state.get_data()
-        user_id = data.get('user_id')  # Получаем ID пользователя
-
         try:
-            poll_id = int(message.text)
+            poll_id = int(message.text)  # Получаем ID голосования из текста сообщения
             poll = await self.fetch_poll(poll_id)
 
             if not poll:
-                raise ValueError
-
+                raise ValueError("Голосование не найдено.")
+            
             if not poll['is_active']:
                 await message.answer("⏰ Это голосование уже завершено.")
                 await state.clear()
                 return
+            
+            # Проверяем, уже проголосовал ли этот пользователь
+            user_id = message.from_user.id
+            async with self.pool.acquire() as conn:
+                existing_vote = await conn.fetchrow(
+                    "SELECT option_id FROM votes WHERE poll_id = $1 AND user_id = $2", poll_id, user_id
+                )
+                if existing_vote:
+                    await message.answer("❌ Вы уже проголосовали в этом голосовании.")
+                    await state.clear()
+                    return
 
+            # Если голосование активно и пользователь еще не голосовал, показываем варианты
             await state.update_data(poll_id=poll_id)
             options = await self.fetch_poll_options(poll_id)
+            if not options:
+                await message.answer("⚠️ Нет вариантов ответа для этого голосования.")
+                await state.clear()
+                return
+
             options_list = [option['option_text'] for option in options]
             await message.answer(
                 f"🗳 Голосование: {poll['title']}\nВыберите вариант:",
                 reply_markup=keyboard.get_poll_options_keyboard(options_list)
             )
+            
             await state.set_state(self.Voting.choosing_option)
 
-        except ValueError:
-            await message.answer("🔢 Пожалуйста, введите корректный ID голосования.")
+        except ValueError as e:
+            await message.answer(f"Ошибка: {str(e)}")
+            await state.clear()
+
 
     async def fetch_poll_options(self, poll_id):
         async with self.pool.acquire() as conn:
-            return await conn.fetch("SELECT * FROM poll_options WHERE poll_id = $1", poll_id)
+            try:
+                return await conn.fetch("SELECT * FROM poll_options WHERE poll_id = $1", poll_id)
+            except Exception as e:
+                print(f"Error fetching poll options: {e}")
+                return []
+            
+    async def fetch_poll(self, poll_id):
+        async with self.pool.acquire() as conn:
+            try:
+                return await conn.fetchrow("SELECT * FROM polls WHERE id = $1", poll_id)
+            except Exception as e:
+                print(f"Error fetching poll: {e}")
+                return None
 
     async def handle_choose_option(self, message: types.Message, state: FSMContext):
-        data = await state.get_data()
-        poll_id = data['poll_id']
+        try:
+            data = await state.get_data()
+            poll_id = data['poll_id']
 
-        options = await self.fetch_poll_options(poll_id)
-        if message.text not in [option['option_text'] for option in options]:
-            await message.answer("⚠️ Пожалуйста, выберите вариант из предложенных.")
-            return
+            user_id = message.from_user.id
+            async with self.pool.acquire() as conn:
+                existing_vote = await conn.fetchrow(
+                    "SELECT option_id FROM votes WHERE poll_id = $1 AND user_id = $2", poll_id, user_id
+                )
 
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                '''
-                INSERT INTO votes (poll_id, user_id, option_id)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (poll_id, user_id) DO NOTHING
-                ''',
-                poll_id,
-                message.from_user.id,     # Используем ID из message
-                message.text               # Можно также добавить option_id, если это необходимо
-            )
+                if existing_vote:
+                    await message.answer("❌ Вы уже проголосовали в этом голосовании.")
+                    return
 
-        await message.answer(f"✅ Спасибо! Ваш голос '{message.text}' засчитан.", reply_markup=keyboard.get_start_keyboard())
+                options = await self.fetch_poll_options(poll_id)
+                option_dict = {option['option_text']: option['id'] for option in options}
+
+                if message.text not in option_dict:
+                    await message.answer("⚠️ Пожалуйста, выберите вариант из предложенных.")
+                    return
+
+                selected_option_id = option_dict[message.text]
+
+                await conn.execute(
+                    '''
+                    INSERT INTO votes (poll_id, user_id, option_id)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (poll_id, user_id) DO NOTHING
+                    ''',
+                    poll_id,
+                    user_id,
+                    selected_option_id
+                )
+
+            await message.answer(f"✅ Спасибо! Ваш голос за '{message.text}' засчитан.", reply_markup=keyboard.get_start_keyboard())
+            await state.clear()
+
+        except Exception as e:
+            print(f"Ошибка в обработке выбора варианта: {e}")
+            await message.answer("ВЫ НЕ МОЖЕТЕ ПРОГОЛОСОВАТЬ ВТОРОЙ РАЗ!!!.")
         await state.clear()
 
     async def handle_cancel(self, message: types.Message, state: FSMContext):
@@ -392,40 +489,77 @@ class bothandler:
     async def handle_statistika(self, message: types.Message):
         logger.log_message(message)
 
-        all_polls = {**self.active_polls, **self.archived_polls}
-
-        if not all_polls:
-            await message.answer("Нет доступных голосований.")
-            return
-
-        response = "📊 Статистика голосований:\n\n"
-
-        for poll_id, poll in all_polls.items():
-            total_votes = sum(poll['votes'].values())
-            end_time = poll['end_time']
-            status = "🟢 Активно" if poll_id in self.active_polls else "🔴 Завершено"
-
-            if total_votes > 0:
-                options_stats = "\n".join(
-                    f"  • {option}: {votes} ({votes / total_votes * 100:.1f}%)"
-                    for option, votes in poll['votes'].items()
+        async with self.pool.acquire() as conn:
+            try:
+                all_polls = await conn.fetch(
+                    """
+                    SELECT
+                    p.id,
+                    p.title,
+                    p.created_at,
+                    p.end_time,
+                    po.option_text,
+                    COUNT(v.option_id) AS votes_count,
+                    CASE WHEN p.end_time > NOW() THEN true ELSE false END AS is_active
+                    FROM
+                        polls p
+                    JOIN
+                        poll_options po ON p.id = po.poll_id
+                    LEFT JOIN
+                        votes v ON po.id = v.option_id
+                    GROUP BY
+                        p.id, po.id  -- Изменено здесь
+                    ORDER BY
+                        p.id;
+                    """
                 )
-            else:
-                options_stats = "\n".join(
-                    f"  • {option}: {votes} (0%)"
-                    for option, votes in poll['votes'].items()
-                )
 
-            response += (
-                f"📌 #{poll_id}: {poll['title']}\n"
-                f"Статус: {status}\n"
-                f"Завершено: {end_time.strftime('%d.%m.%Y %H:%M')}\n"
-                f"Всего голосов: {total_votes}\n"
-                f"{options_stats}\n\n"
-            )
+                if not all_polls:
+                    await message.answer("Не найдено ни одного голосования.")
+                    return
 
-        await message.answer(response)
-        await self.show_main_menu(message)
+                response = "📊 Статистика голосований:\n\n"
+                polls_stats = {}
+
+                for poll in all_polls:
+                    poll_id = poll['id']
+                    if poll_id not in polls_stats:
+                        polls_stats[poll_id] = {
+                            "title": poll['title'],
+                            "created_at": poll['created_at'],
+                            "end_time": poll['end_time'],
+                            "votes": 0,
+                            "options": {}
+                        }
+
+                    option = poll['option_text']
+                    votes = poll['votes_count']
+
+                    polls_stats[poll_id]["votes"] += votes
+                    polls_stats[poll_id]["options"][option] = votes
+
+                for poll_id, stats in polls_stats.items():
+                    options_stats = stats["options"]
+                    total_votes = stats["votes"]
+                    option_strings = [
+                        f"  • {option}: {votes} ({(votes / total_votes * 100) if total_votes > 0 else 0:.1f}%)"
+                        for option, votes in options_stats.items()
+                    ]
+
+                    response += ( 
+                        f"📌 #{poll_id}: {stats['title']}\n"
+                        f"Создано: {stats['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
+                        f"Завершится: {stats['end_time'].strftime('%d.%m.%Y %H:%M')}\n"
+                        f"Статус: {'🔴 Завершено' if not poll['is_active'] else '🟢 Активно'}\n"
+                        f"Всего голосов: {total_votes}\n"
+                        f"{''.join([s + '\n' for s in option_strings])}\n\n"
+                    )
+
+                await message.answer(response)
+
+            except Exception as e:
+                await message.answer(f"Ошибка при получении статистики: {e}")
+
 
     async def count_votes(self, poll_id):
         async with self.pool.acquire() as conn:
@@ -433,11 +567,28 @@ class bothandler:
         
     async def handle_help(self, message: types.Message):
         logger.log_message(message)
-        await message.answer("Справка:\n" + "\n".join(config.AVAILABLE_COMMANDS))
+        
+        help_message = (
+            "Спасибо, что выбрали нашего бота Voting Bot — это бот для проведения опросов в Telegram "
+            "с сохранением и выводом статистики по каждому опросу.\n\n"
+            "Доступные команды:\n"
+            "Удалить/Завершить голосование\n"
+            "Создать голосование\n"
+            "Проголосовать\n"
+            "Статистика\n"
+            "Справка"
+        )
+    
+        await message.answer(help_message)
         await self.show_main_menu(message)
 
     async def handle_any_message(self, message: types.Message):
-        logger.log_message(message)
+        try:
+            # Обработка сообщения
+            await message.answer("Нельзя.")
+        except Exception as e:
+            print(f"Сообщение об ошибке обработки: {e}")
+            await message.answer(f"Извините, произошла ошибка. Повторите попытку позже. ({e})")
 
     async def run(self):
         await self.init_db()
