@@ -158,7 +158,7 @@ class bothandler:
     async def handle_choose_poll_to_manage(self, message: types.Message, state: FSMContext):
         """Обработка выбора голосования для управления"""
         data = await state.get_data()
-        user_id = data.get('user_id')  # Получаем ID пользователя
+        user_id = message.from_user.id  # Получаем ID пользователя
 
         try:
             poll_id = int(message.text)  # Получаем ID голосования из текста сообщения
