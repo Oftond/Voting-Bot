@@ -1,3 +1,4 @@
+import asyncio
 import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -101,6 +102,7 @@ class bothandler:
     # Основные команды
     async def cmd_start(self, message: types.Message):
         logger.log_message(message)
+        await self.upsert_user(message.from_user.id, message.from_user.username)
         await self.show_main_menu(message)
 
     async def handle_vote(self, message: types.Message, state: FSMContext):
@@ -109,12 +111,9 @@ class bothandler:
             await message.answer("⏳ Нет активных голосований.")
             return
 
-        # Correctly construct the polls list for the user
+        # Конструируем список голосований для пользователя
         polls_list = "\n".join(f"ID: {poll['id']} - {poll['title']}" for poll in active_polls)
-        await message.answer(f"📝 Доступные голосования:\n\n{polls_list}", reply_markup=keyboard.get_cancel_keyboard())
-        await state.set_state(self.Voting.choosing_poll)
 
-        polls_list = "\n".join(f"ID: {poll['id']} - {poll['title']}" for poll in active_polls)
         await message.answer(f"📝 Доступные голосования:\n\n{polls_list}", reply_markup=keyboard.get_cancel_keyboard())
         await state.set_state(self.Voting.choosing_poll)
 
@@ -157,7 +156,6 @@ class bothandler:
 
     async def handle_choose_poll_to_manage(self, message: types.Message, state: FSMContext):
         """Обработка выбора голосования для управления"""
-        data = await state.get_data()
         user_id = message.from_user.id  # Получаем ID пользователя
 
         try:
@@ -178,7 +176,7 @@ class bothandler:
             creator_id = poll['creator_id']
             if creator_id != user_id:  # Проверка прав на управление
                 await message.answer("❌ У вас нет прав на управление этим голосованием.")
-                await state.clear()
+                await state.set_state(self.PollManagement.choosing_poll)  # Повторно устанавливаем состояние
                 return
 
             # Определяем статус голосования
@@ -196,7 +194,7 @@ class bothandler:
 
         except ValueError as e:
             await message.answer(f"Ошибка: {str(e)}")
-            await state.clear()
+            await state.set_state(self.PollManagement.choosing_poll)  # Устанавливаем состояние повторно
             
     async def handle_confirm_management(self, message: types.Message, state: FSMContext):
         """Обработка подтверждения действия"""
@@ -398,6 +396,7 @@ class bothandler:
                 )
                 if existing_vote:
                     await message.answer("❌ Вы уже проголосовали в этом голосовании.")
+                    await self.show_main_menu(message)  # Перенаправляем пользователя в главное меню
                     await state.clear()
                     return
 
@@ -419,6 +418,7 @@ class bothandler:
 
         except ValueError as e:
             await message.answer(f"Ошибка: {str(e)}")
+            await self.show_main_menu(message)  # Можно также вернуть пользователя в главное меню
             await state.clear()
 
 
@@ -442,19 +442,26 @@ class bothandler:
         try:
             data = await state.get_data()
             poll_id = data['poll_id']
-
             user_id = message.from_user.id
+
+            # Получаем варианты голосования
+            options = await self.fetch_poll_options(poll_id)
+            option_dict = {option['option_text']: option['id'] for option in options}
+
+            # Убедитесь, что пользователь существует в базе
+            username = message.from_user.username  # Получаем имя пользователя
+            await self.upsert_user(user_id, username)
+
+            # Проверяем, уже проголосовал ли этот пользователь
             async with self.pool.acquire() as conn:
                 existing_vote = await conn.fetchrow(
                     "SELECT option_id FROM votes WHERE poll_id = $1 AND user_id = $2", poll_id, user_id
                 )
-
                 if existing_vote:
                     await message.answer("❌ Вы уже проголосовали в этом голосовании.")
+                    await self.show_main_menu(message)  # Возврат в главное меню
+                    await state.clear()
                     return
-
-                options = await self.fetch_poll_options(poll_id)
-                option_dict = {option['option_text']: option['id'] for option in options}
 
                 if message.text not in option_dict:
                     await message.answer("⚠️ Пожалуйста, выберите вариант из предложенных.")
@@ -462,6 +469,7 @@ class bothandler:
 
                 selected_option_id = option_dict[message.text]
 
+                # Запись голоса пользователя в БД
                 await conn.execute(
                     '''
                     INSERT INTO votes (poll_id, user_id, option_id)
@@ -478,8 +486,8 @@ class bothandler:
 
         except Exception as e:
             print(f"Ошибка в обработке выбора варианта: {e}")
-            await message.answer("ВЫ НЕ МОЖЕТЕ ПРОГОЛОСОВАТЬ ВТОРОЙ РАЗ!!!.")
-        await state.clear()
+            await message.answer("Произошла ошибка. Повторите попытку позже.")
+            await state.clear()
 
     async def handle_cancel(self, message: types.Message, state: FSMContext):
         logger.log_message(message)
@@ -500,7 +508,7 @@ class bothandler:
                     p.end_time,
                     po.option_text,
                     COUNT(v.option_id) AS votes_count,
-                    CASE WHEN p.end_time > NOW() THEN true ELSE false END AS is_active
+                    CASE WHEN p.is_active THEN true ELSE false END AS is_active
                     FROM
                         polls p
                     JOIN
@@ -508,7 +516,7 @@ class bothandler:
                     LEFT JOIN
                         votes v ON po.id = v.option_id
                     GROUP BY
-                        p.id, po.id  -- Изменено здесь
+                        p.id, po.id
                     ORDER BY
                         p.id;
                     """
@@ -529,6 +537,7 @@ class bothandler:
                             "created_at": poll['created_at'],
                             "end_time": poll['end_time'],
                             "votes": 0,
+                            "is_active": poll['is_active'],
                             "options": {}
                         }
 
@@ -546,11 +555,13 @@ class bothandler:
                         for option, votes in options_stats.items()
                     ]
 
+                    status = "🔴 Завершено" if not stats["is_active"] else "🟢 Активно"
+
                     response += ( 
                         f"📌 #{poll_id}: {stats['title']}\n"
                         f"Создано: {stats['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
                         f"Завершится: {stats['end_time'].strftime('%d.%m.%Y %H:%M')}\n"
-                        f"Статус: {'🔴 Завершено' if not poll['is_active'] else '🟢 Активно'}\n"
+                        f"Статус: {status}\n"
                         f"Всего голосов: {total_votes}\n"
                         f"{''.join([s + '\n' for s in option_strings])}\n\n"
                     )
@@ -562,12 +573,12 @@ class bothandler:
 
 
     async def count_votes(self, poll_id):
-        async with self.pool.acquire() as conn:
-            return await conn.fetchval('SELECT COUNT(*) FROM votes WHERE poll_id = $1', poll_id)
-        
+            async with self.pool.acquire() as conn:
+                return await conn.fetchval('SELECT COUNT(*) FROM votes WHERE poll_id = $1', poll_id)
+            
     async def handle_help(self, message: types.Message):
         logger.log_message(message)
-        
+            
         help_message = (
             "Спасибо, что выбрали нашего бота Voting Bot — это бот для проведения опросов в Telegram "
             "с сохранением и выводом статистики по каждому опросу.\n\n"
@@ -578,22 +589,56 @@ class bothandler:
             "Статистика\n"
             "Справка"
         )
-    
         await message.answer(help_message)
         await self.show_main_menu(message)
 
+    # Добавьте этот метод в класс bothandler
+    async def show_available_commands(self, message: types.Message):
+        commands = (
+            "/start - Начать взаимодействие с ботом\n"
+            "/удалить - Удалить/Завершить голосование\n"
+            "/создать - Создать новое голосование\n"
+            "/проголосовать - Проголосовать в активном голосовании\n"
+            "/статистика - Показать статистику голосований\n"
+            "/справка - Получить справочную информацию"
+        )
+        await message.answer(f"Неизвестная команда. Доступные команды:\n{commands}")
+
+    # Обновите метод handle_any_message
     async def handle_any_message(self, message: types.Message):
-        try:
-            # Обработка сообщения
-            await message.answer("Нельзя.")
-        except Exception as e:
-            print(f"Сообщение об ошибке обработки: {e}")
-            await message.answer(f"Извините, произошла ошибка. Повторите попытку позже. ({e})")
+        await message.answer("❌ Команда не распознана.")
+        await self.show_available_commands(message)
+
+    async def update_polls(self):
+        await asyncio.sleep(10)  # Обновляем информацию о голосованиях каждые 10c
+        await self.update_active_polls()
+        await self.update_archived_polls()
+
+    async def update_active_polls(self):
+        async with self.pool.acquire() as conn:
+            try:
+                active_polls = await conn.fetch("SELECT * FROM polls WHERE is_active = TRUE AND end_time > NOW()")
+                for poll in active_polls:
+                    # Обновляем информацию о голосовании в БД
+                    await conn.execute("UPDATE polls SET last_updated = NOW() WHERE id = $1", poll['id'])
+            except Exception as e:
+                print(f"Error updating active polls: {e}")
+
+    async def update_archived_polls(self):
+        async with self.pool.acquire() as conn:
+            try:
+                archived_polls = await conn.fetch("SELECT * FROM polls WHERE is_active = FALSE AND end_time <= NOW()")
+                for poll in archived_polls:
+                    # Обновляем информацию о голосовании в БД
+                    await conn.execute("UPDATE polls SET last_updated = NOW() WHERE id = $1", poll['id'])
+            except Exception as e:
+                print(f"Error updating archived polls: {e}")
 
     async def run(self):
         await self.init_db()
         print("🟢 Бот запущен и начал логирование...")
         try:
             await self.dp.start_polling(self.bot)
+            self.dp.loop.create_task(self.update_polls())
         finally:
             await self.close_db()
