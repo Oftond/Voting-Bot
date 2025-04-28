@@ -1,5 +1,0 @@
-aiogram
-asyncio
-asyncpg
-dotenv
-keyboard
