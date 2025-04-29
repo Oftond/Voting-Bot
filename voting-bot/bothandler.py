@@ -119,9 +119,12 @@ class bothandler:
         await self.show_main_menu(message)
 
     async def handle_vote(self, message: types.Message, state: FSMContext):
-        active_polls = await self.fetch_active_polls()
+        user_id = message.from_user.id  # Получаем ID пользователя
+
+        # Получаем только те голосования, в которых пользователь является участником
+        active_polls = await self.fetch_active_polls(user_id=user_id)
         if not active_polls:
-            await message.answer("⏳ Нет активных голосований.")
+            await message.answer("⏳ У вас нет активных голосований для участия.")
             return
 
         # Конструируем список голосований для пользователя
@@ -131,11 +134,16 @@ class bothandler:
         await state.set_state(self.Voting.choosing_poll)
 
     async def fetch_active_polls(self, user_id=None):
-        query = "SELECT * FROM polls WHERE is_active = TRUE AND end_time > NOW()"
+        query = """SELECT * FROM polls 
+                WHERE is_active = TRUE AND end_time > NOW()"""
         params = []
-        
+
         if user_id:  # Фильтрация по пользователю
-            query += " AND creator_id = $1"
+            # Обработка приватных голосований
+            query += """ AND (is_private = FALSE OR id IN (
+                            SELECT poll_id 
+                            FROM poll_participants 
+                            WHERE user_id = $1))"""
             params.append(user_id)  # Добавляем user_id в список параметров
 
         async with self.pool.acquire() as conn:
@@ -150,8 +158,9 @@ class bothandler:
         data = await state.get_data()
         user_id = data.get('user_id')  # Получаем ID пользователя
 
+        # Получаем только те голосования, в которых пользователь является создателем или участником
         polls_to_show = await self.fetch_active_polls(user_id=user_id)
-        
+
         if not polls_to_show:
             await message.answer("Нет доступных голосований для управления.")
             return
@@ -728,6 +737,12 @@ class bothandler:
                 await message.answer("Голосование не найдено или оно не является приватным.")
                 return
             
+            # Сначала проверьте, является ли пользователь создателем голосования
+            user_id = message.from_user.id
+            if poll['creator_id'] != user_id:
+                await message.answer("❌ У вас нет прав на управление этим голосованием.")
+                return
+
             # Показываем текстовое сообщение для ввода ID участников
             await message.answer("Введите ID участников через запятую (например: 123456, 789012): ")
             
@@ -837,7 +852,7 @@ class bothandler:
         for part in parts:
             await message.answer(part)
 
-    async def run(self):
+    async def run(self): 
         await self.init_db()
         print("🟢 Бот запущен и начал логирование...")
         try:
