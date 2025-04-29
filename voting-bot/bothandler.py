@@ -12,7 +12,6 @@ import config
 import asyncpg
 import sys
 
-
 class UserMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if isinstance(event, types.Message):
@@ -22,7 +21,6 @@ class UserMiddleware(BaseMiddleware):
             user_id = event.from_user.id
             data['user_id'] = user_id
         return await handler(event, data)
-
 
 class bothandler:
     class PollCreation(StatesGroup):
@@ -91,7 +89,6 @@ class bothandler:
         self.dp.message.register(self.handle_help, F.text == "Справка")
         self.dp.message.register(self.handle_cancel, F.text == "Отмена")
         self.dp.message.register(self.handle_add_participant, F.text == "Добавить участника к приватному голосованию")  # Кнопка для добавления участников
-        self.dp.message.register(self.handle_show_users, F.text == "Показать всех пользователей")
 
         self.dp.message.register(self.handle_poll_title_input, StateFilter(self.PollCreation.waiting_for_title))
         self.dp.message.register(self.handle_poll_options_input, StateFilter(self.PollCreation.waiting_for_options))
@@ -119,12 +116,9 @@ class bothandler:
         await self.show_main_menu(message)
 
     async def handle_vote(self, message: types.Message, state: FSMContext):
-        user_id = message.from_user.id  # Получаем ID пользователя
-
-        # Получаем только те голосования, в которых пользователь является участником
-        active_polls = await self.fetch_active_polls(user_id=user_id)
+        active_polls = await self.fetch_active_polls()
         if not active_polls:
-            await message.answer("⏳ У вас нет активных голосований для участия.")
+            await message.answer("⏳ Нет активных голосований.")
             return
 
         # Конструируем список голосований для пользователя
@@ -134,16 +128,11 @@ class bothandler:
         await state.set_state(self.Voting.choosing_poll)
 
     async def fetch_active_polls(self, user_id=None):
-        query = """SELECT * FROM polls 
-                WHERE is_active = TRUE AND end_time > NOW()"""
+        query = "SELECT * FROM polls WHERE is_active = TRUE AND end_time > NOW()"
         params = []
-
-        if user_id:  # Фильтрация по пользователю
-            # Обработка приватных голосований
-            query += """ AND (is_private = FALSE OR id IN (
-                            SELECT poll_id 
-                            FROM poll_participants 
-                            WHERE user_id = $1))"""
+        
+        if user_id:  # Filter by user if provided
+            query += " AND creator_id = $1"
             params.append(user_id)  # Добавляем user_id в список параметров
 
         async with self.pool.acquire() as conn:
@@ -158,9 +147,8 @@ class bothandler:
         data = await state.get_data()
         user_id = data.get('user_id')  # Получаем ID пользователя
 
-        # Получаем только те голосования, в которых пользователь является создателем или участником
         polls_to_show = await self.fetch_active_polls(user_id=user_id)
-
+        
         if not polls_to_show:
             await message.answer("Нет доступных голосований для управления.")
             return
@@ -202,7 +190,7 @@ class bothandler:
             creator_id = poll['creator_id']
             if creator_id != user_id:  # Проверка прав на управление
                 await message.answer("❌ У вас нет прав на управление этим голосованием.")
-                await state.set_state(self.PollManagement.choosing_poll)  # Повторно выставляем состояние
+                await state.set_state(self.PollManagement.choosing_poll)  # Повторно устанавливаем состояние
                 return
 
             # Определяем статус голосования
@@ -272,7 +260,7 @@ class bothandler:
             await state.clear()
 
         except (ValueError, KeyError) as e:
-            await message.answer(f"Ошибка: {str(e)}")
+            await message.answer(f"Ошибка: {e}")
             await state.clear()
 
     async def delete_poll(self, poll_id):
@@ -326,8 +314,7 @@ class bothandler:
         data = await state.get_data()
         is_private = data.get('is_private', False)
         if is_private:
-            await message.answer("Введите ID участников (через запятую):")
-            await self.handle_show_users(message)
+            await message.answer("Введите ID участников (через запятую):", reply_markup=keyboard.get_cancel_keyboard())
             await state.set_state(self.PollCreation.waiting_for_participants)  # Переход к вводу участников
         else:
             await message.answer("Введите варианты ответов через запятую (например: Да, Нет, Воздержался):", reply_markup=keyboard.get_cancel_keyboard())
@@ -340,8 +327,7 @@ class bothandler:
         # Подтвердите, что они все верные ID
         if not all(pid.isdigit() for pid in participant_ids):
             await message.answer("Пожалуйста, введите корректные ID участников через запятую.")
-            
-            await self.handle_show_users(message)
+            return
         
         # Сохраняем ID участников в состоянии
         await state.update_data(participant_ids=participant_ids)
@@ -622,6 +608,7 @@ class bothandler:
                     await message.answer("Не найдено ни одного голосования.")
                     return
 
+                response = "📊 Статистика голосований:\n\n"
                 polls_stats = {}
 
                 for poll in all_polls:
@@ -642,7 +629,6 @@ class bothandler:
                     polls_stats[poll_id]["votes"] += votes
                     polls_stats[poll_id]["options"][option] = votes
 
-                # Отправляем каждую статистику голосования в отдельном сообщении
                 for poll_id, stats in polls_stats.items():
                     options_stats = stats["options"]
                     total_votes = stats["votes"]
@@ -653,16 +639,16 @@ class bothandler:
 
                     status = "🔴 Завершено" if not stats["is_active"] else "🟢 Активно"
 
-                    response = (
+                    response += ( 
                         f"📌 #{poll_id}: {stats['title']}\n"
                         f"Создано: {stats['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
                         f"Завершится: {stats['end_time'].strftime('%d.%m.%Y %H:%M')}\n"
                         f"Статус: {status}\n"
                         f"Всего голосов: {total_votes}\n"
-                        f"{''.join([s + '\n' for s in option_strings])}\n"
+                        f"{''.join([s + '\n' for s in option_strings])}\n\n"
                     )
 
-                    await self.send_long_message(message, response)  # Отправляем сообщение для каждого голосования
+                await message.answer(response)
 
             except Exception as e:
                 await message.answer(f"Ошибка при получении статистики: {e}")
@@ -736,28 +722,18 @@ class bothandler:
             if not poll or not poll['is_private']:
                 await message.answer("Голосование не найдено или оно не является приватным.")
                 return
-            
-            # Сначала проверьте, является ли пользователь создателем голосования
-            user_id = message.from_user.id
-            if poll['creator_id'] != user_id:
-                await message.answer("❌ У вас нет прав на управление этим голосованием.")
-                return
 
-            # Показываем текстовое сообщение для ввода ID участников
-            await message.answer("Введите ID участников через запятую (например: 123456, 789012): ")
-            
-            """Обработка команды для показа всех пользователей."""
-            users = await self.fetch_all_users()  # Получаем всех пользователей из БД
+            # Новый метод для получения списка пользователей
+            users = await self.fetch_all_users()
             if not users:
-                await message.answer("Не найдено пользователей.")
+                await message.answer("Не найдено пользователей для добавления.")
                 return
 
-            # Формируем ответ
-            users_list = "\n".join(f"ID: {user['telegram_id']} - {user['username'] or 'Без имени'}" for user in users)
-            await message.answer(f"Список пользователей:\n\n{users_list}")
+            # Формирование и отправка сообщения со списком пользователей
+            user_list = "\n".join(f"ID: {user['telegram_id']} - {user['username'] or 'Без имени'}" for user in users)
+            await message.answer(f"Список пользователей:\n{user_list}\n\nВведите ID пользователей, которых хотите добавить (через запятую):", reply_markup=keyboard.get_cancel_keyboard())
 
-            # Сохраняем poll_id для дальнейшего использования
-            await state.update_data(poll_id=poll_id)
+            await state.update_data(poll_id=poll_id)  # Сохраняем poll_id для дальнейшего использования
             await state.set_state(self.PollManagement.adding_participants)
 
         except ValueError:
@@ -773,40 +749,32 @@ class bothandler:
                 return []
 
     async def handle_add_participants_input(self, message: types.Message, state: FSMContext):
-        """Обработка добавления участника к приватному голосованию"""
+        """Обработка добавления участников к приватному голосованию"""
         data = await state.get_data()
         poll_id = data['poll_id']
 
-        # Проверяем, были ли введены ID участников
-        if message.text:
-            participant_ids = message.text.split(',')
-            participant_ids = [pid.strip() for pid in participant_ids]  # Удаляем лишние пробелы
+        participant_ids = message.text.split(',')
+        participant_ids = [pid.strip() for pid in participant_ids]  # Удаляем лишние пробелы
 
-            # Подтвердите, что они все верные ID
-            if not all(pid.isdigit() for pid in participant_ids):
-                await message.answer("Пожалуйста, введите корректные ID участников через запятую.")
-                return
-            
-            # Сохраняем ID участников в состоянии
-            await state.update_data(participant_ids=participant_ids)
+        # Подтвердите, что они все верные ID
+        if not all(pid.isdigit() for pid in participant_ids):
+            await message.answer("Пожалуйста, введите корректные ID участников через запятую.")
+            return
 
-            # Добавляем участников в базу данных
-            async with self.pool.acquire() as conn:
-                for pid in participant_ids:
-                    await conn.execute(
-                        '''
-                        INSERT INTO poll_participants (poll_id, user_id)
-                        VALUES ($1, $2)
-                        ON CONFLICT DO NOTHING
-                        ''',
-                        poll_id,
-                        int(pid)  # используем int, чтобы это соответствовало BIGINT в БД
-                    )
-            
-            await message.answer("✅ Участники успешно добавлены к приватному голосованию.", reply_markup=keyboard.get_start_keyboard())
-            await state.clear()
-        else:
-            await message.answer("⚠️ Пожалуйста, введите ID участников.")
+        async with self.pool.acquire() as conn:
+            for pid in participant_ids:
+                await conn.execute(
+                    '''
+                    INSERT INTO poll_participants (poll_id, user_id)
+                    VALUES ($1, $2)
+                    ON CONFLICT DO NOTHING
+                    ''',
+                    poll_id,
+                    int(pid)
+                )
+                
+        await message.answer("✅ Участники успешно добавлены к приватному голосованию.", reply_markup=keyboard.get_start_keyboard())
+        await state.clear()
 
     async def update_polls(self):
         await asyncio.sleep(10)  # Обновляем информацию о голосованиях каждые 10с
@@ -833,26 +801,7 @@ class bothandler:
             except Exception as e:
                 print(f"Error updating archived polls: {e}")
 
-    async def handle_show_users(self, message: types.Message):
-        """Обработка команды для показа всех пользователей."""
-        users = await self.fetch_all_users()  # Получаем всех пользователей из БД
-        if not users:
-            await message.answer("Не найдено пользователей.")
-            return
-
-        # Формируем ответ
-        users_list = "\n".join(f"ID: {user['telegram_id']} - {user['username'] or 'Без имени'}" for user in users)
-        await message.answer(f"Список пользователей:\n\n{users_list}")
-
-    async def send_long_message(self, message: types.Message, text: str):
-        """Отправляет сообщение по частям, если оно слишком длинное."""
-        max_length = 4096
-        parts = [text[i:i + max_length] for i in range(0, len(text), max_length)]
-        
-        for part in parts:
-            await message.answer(part)
-
-    async def run(self): 
+    async def run(self):
         await self.init_db()
         print("🟢 Бот запущен и начал логирование...")
         try:

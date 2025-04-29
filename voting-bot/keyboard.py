@@ -3,6 +3,15 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 class keyboard:
     @staticmethod
+    def get_privacy_keyboard():
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Публичное"), KeyboardButton(text="Приватное")]
+            ],
+            resize_keyboard=True
+        )
+
+    @staticmethod
     def get_start_keyboard():
         return ReplyKeyboardMarkup(
             keyboard=[
@@ -11,7 +20,6 @@ class keyboard:
                 [KeyboardButton(text="Проголосовать")],
                 [KeyboardButton(text="Статистика")],
                 [KeyboardButton(text="Справка")],
-                [KeyboardButton(text="Показать всех пользователей")],
             ],
             resize_keyboard=True
         )
@@ -40,15 +48,6 @@ class keyboard:
             keyboard=[
                 [KeyboardButton(text="Удалить"), KeyboardButton(text="Завершить")],
                 [KeyboardButton(text="Отмена")]
-            ],
-            resize_keyboard=True
-        )
-    
-    @staticmethod
-    def get_privacy_keyboard():
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="Публичное"), KeyboardButton(text="Приватное")]
             ],
             resize_keyboard=True
         )
