@@ -52,3 +52,12 @@ class keyboard:
             ],
             resize_keyboard=True
         )
+    
+    @staticmethod
+    def get_data_type_keyboard():
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Числовой"), KeyboardButton(text="Строчный")]
+            ],
+            resize_keyboard=True
+        )

@@ -26,10 +26,11 @@ class UserMiddleware(BaseMiddleware):
 
 class bothandler:
     class PollCreation(StatesGroup):
+        waiting_for_privacy = State()  # Новый шаг для выбора приватности
+        waiting_for_data_type = State()  # Новый шаг для выбора типа данных
         waiting_for_title = State()
         waiting_for_options = State()
         waiting_for_duration = State()
-        waiting_for_privacy = State()  # Новый шаг для выбора приватности
         waiting_for_participants = State()  # Новый шаг для ввода участников
 
     class Voting(StatesGroup):
@@ -98,6 +99,7 @@ class bothandler:
         self.dp.message.register(self.handle_poll_duration_input, StateFilter(self.PollCreation.waiting_for_duration))
         self.dp.message.register(self.handle_privacy_input, StateFilter(self.PollCreation.waiting_for_privacy))
         self.dp.message.register(self.handle_poll_participants_input, StateFilter(self.PollCreation.waiting_for_participants))
+        self.dp.message.register(self.handle_data_type_input, StateFilter(self.PollCreation.waiting_for_data_type))
 
         self.dp.message.register(self.handle_choose_poll, StateFilter(self.Voting.choosing_poll))
         self.dp.message.register(self.handle_choose_option, StateFilter(self.Voting.choosing_option))
@@ -130,7 +132,10 @@ class bothandler:
         # Конструируем список голосований для пользователя
         polls_list = "\n".join(f"ID: {poll['id']} - {poll['title']}" for poll in active_polls)
 
-        await message.answer(f"📝 Доступные голосования:\n\n{polls_list}", reply_markup=keyboard.get_cancel_keyboard())
+        await message.answer(
+            f"📝 Доступные голосования:\n\n{polls_list}\n\nВыберите одно из голосований по ID или названию:",
+            reply_markup=keyboard.get_cancel_keyboard()
+        )
         await state.set_state(self.Voting.choosing_poll)
 
     async def fetch_active_polls(self, user_id=None):
@@ -152,6 +157,34 @@ class bothandler:
             except Exception as e:
                 print(f"Error fetching active polls: {e}")
                 return []
+            
+    async def cmd_start(self, message: types.Message):
+        logger.log_message(message)
+        user_id = message.from_user.id
+        username = message.from_user.username
+
+        # Проверяем, есть ли пользователь в базе
+        is_new_user = await self.is_new_user(user_id)
+
+        # Добавляем/обновляем пользователя в базе
+        await self.upsert_user(user_id, username)
+
+        # Если пользователь новый - показываем приветственное сообщение
+        if is_new_user:
+            welcome_msg = (
+                "Voting Bot - это бот для проведения опросов в телеграмме "
+                "с сохранением и выводом статистики по каждому опросу.\n\n"
+                "Выберите действие:"
+            )
+            await message.answer(welcome_msg, reply_markup=keyboard.get_start_keyboard())
+        else:
+            await self.show_main_menu(message)
+
+    async def is_new_user(self, user_id: int) -> bool:
+        """Проверяет, является ли пользователь новым (отсутствует в базе)"""
+        async with self.pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT 1 FROM users WHERE telegram_id = $1", user_id)
+            return user is None
 
     async def handle_delete(self, message: types.Message, state: FSMContext):
         """Обработка кнопки 'Удалить/Завершить голосование'"""
@@ -312,8 +345,9 @@ class bothandler:
         
         await state.update_data(is_private=(message.text == 'Приватное'))
 
-        await message.answer("Введите название голосования:", reply_markup=keyboard.get_cancel_keyboard())
-        await state.set_state(self.PollCreation.waiting_for_title)
+        # Запросить тип данных
+        await message.answer("Выберите тип данных для ответов:", reply_markup=keyboard.get_data_type_keyboard())
+        await state.set_state(self.PollCreation.waiting_for_data_type)
 
     async def handle_poll_title_input(self, message: types.Message, state: FSMContext):
         if len(message.text) > 200:
@@ -330,7 +364,12 @@ class bothandler:
             await self.handle_show_users(message)
             await state.set_state(self.PollCreation.waiting_for_participants)  # Переход к вводу участников
         else:
-            await message.answer("Введите варианты ответов через запятую (например: Да, Нет, Воздержался):", reply_markup=keyboard.get_cancel_keyboard())
+            data_type = data.get('data_type')
+            if data_type == "Числовой":
+                await message.answer("Введите варианты ответов через запятую (например: 1, 2, 3):", reply_markup=keyboard.get_cancel_keyboard())
+            else:
+                await message.answer("Введите варианты ответов через запятую (например: Да, Нет, Воздержался):", reply_markup=keyboard.get_cancel_keyboard())
+            
             await state.set_state(self.PollCreation.waiting_for_options)
 
     async def handle_poll_participants_input(self, message: types.Message, state: FSMContext):
@@ -352,6 +391,15 @@ class bothandler:
     async def handle_poll_options_input(self, message: types.Message, state: FSMContext):
         options = message.text.split(',')
         options = [option.strip() for option in options]  # Удаляем лишние пробелы
+
+        data = await state.get_data()
+        data_type = data.get('data_type')
+
+        if data_type == "Числовой":
+            if not all(option.isdigit() for option in options):
+                await message.answer("Пожалуйста, вводите только числа для числового типа ответа.")
+                return
+
         if len(options) < 2:
             await message.answer("Нужно минимум 2 варианта ответа!")
             return
@@ -397,13 +445,14 @@ class bothandler:
             # Сохраняем опрос
             poll_id = await conn.fetchval(
                 '''
-                INSERT INTO polls (title, creator_id, end_time, is_active, is_private)
-                VALUES ($1, $2, $3, TRUE, $4) RETURNING id
+                INSERT INTO polls (title, creator_id, end_time, is_active, is_private, data_type)
+                VALUES ($1, $2, $3, TRUE, $4, $5) RETURNING id
                 ''',
                 poll_data['title'],
                 user_id,
                 end_time,
-                poll_data.get('is_private')  # Учет приватности
+                poll_data.get('is_private'),
+                poll_data.get('data_type')  # Сохраняем тип данных
             )
 
             # Сохраняем варианты опроса
@@ -452,64 +501,69 @@ class bothandler:
             await state.clear()
 
     async def handle_choose_poll(self, message: types.Message, state: FSMContext):
-        try:
-            poll_id = int(message.text)  # Получаем ID голосования из текста сообщения
+        user_id = message.from_user.id
+        user_input = message.text.strip()  # Remove extra spaces
+
+        # Check if the input is a number (poll ID) or a title
+        if user_input.isdigit():
+            poll_id = int(user_input)
             poll = await self.fetch_poll(poll_id)
+        else:
+            poll = await self.fetch_poll_by_title(user_input)
 
-            if not poll:
-                raise ValueError("Голосование не найдено.")
-            
-            if not poll['is_active']:
-                await message.answer("⏰ Это голосование уже завершено.")
-                await state.clear()
-                return
-            
-            user_id = message.from_user.id
-
-            # Проверяем, если голосование приватное
-            if poll['is_private']:
-                # Проверка, существует ли пользователь в списке участников
-                participant = await self.pool.fetchrow(
-                    "SELECT 1 FROM poll_participants WHERE poll_id = $1 AND user_id = $2",
-                    poll_id, user_id
-                )
-                if not participant:
-                    await message.answer("❌ У вас нет доступа к этому приватному голосованию.")
-                    await self.show_main_menu(message)
-                    await state.clear()
-                    return
-
-            # Проверяем, уже проголосовал ли этот пользователь
-            async with self.pool.acquire() as conn:
-                existing_vote = await conn.fetchrow(
-                    "SELECT option_id FROM votes WHERE poll_id = $1 AND user_id = $2", poll_id, user_id
-                )
-                if existing_vote:
-                    await message.answer("❌ Вы уже проголосовали в этом голосовании.")
-                    await self.show_main_menu(message)  # Возврат в главное меню
-                    await state.clear()
-                    return
-
-            # Если голосование активно и пользователь еще не голосовал, показываем варианты
-            await state.update_data(poll_id=poll_id)
-            options = await self.fetch_poll_options(poll_id)
-            if not options:
-                await message.answer("⚠️ Нет вариантов ответа для этого голосования.")
-                await state.clear()
-                return
-
-            options_list = [option['option_text'] for option in options]
-            await message.answer(
-                f"🗳 Голосование: {poll['title']}\nВыберите вариант:",
-                reply_markup=keyboard.get_poll_options_keyboard(options_list)
-            )
-            
-            await state.set_state(self.Voting.choosing_option)
-
-        except ValueError as e:
-            await message.answer(f"Ошибка: {str(e)}")
+        if not poll or not poll['is_active'] or datetime.now() > poll['end_time']:
+            await message.answer("⏰ Это голосование уже завершено или не найдено.")
             await self.show_main_menu(message)
             await state.clear()
+            return
+
+        # Проверяем, если голосование приватное
+        if poll['is_private']:
+            # Проверка, существует ли пользователь в списке участников
+            participant = await self.pool.fetchrow(
+                "SELECT 1 FROM poll_participants WHERE poll_id = $1 AND user_id = $2",
+                poll['id'], user_id
+            )
+            if not participant:
+                await message.answer("❌ У вас нет доступа к этому приватному голосованию.")
+                await self.show_main_menu(message)
+                await state.clear()
+                return
+
+        # Проверяем, уже проголосовал ли этот пользователь
+        async with self.pool.acquire() as conn:
+            existing_vote = await conn.fetchrow(
+                "SELECT option_id FROM votes WHERE poll_id = $1 AND user_id = $2", poll['id'], user_id
+            )
+            if existing_vote:
+                await message.answer("❌ Вы уже проголосовали в этом голосовании.")
+                await self.show_main_menu(message)  # Возврат в главное меню
+                await state.clear()
+                return
+
+        # Если голосование активно и пользователь еще не голосовал, показываем варианты
+        await state.update_data(poll_id=poll['id'])
+        options = await self.fetch_poll_options(poll['id'])
+        if not options:
+            await message.answer("⚠️ Нет вариантов ответа для этого голосования.")
+            await state.clear()
+            return
+
+        options_list = [option['option_text'] for option in options]
+        await message.answer(
+            f"🗳 Голосование: {poll['title']}\nВыберите вариант:",
+            reply_markup=keyboard.get_poll_options_keyboard(options_list)
+        )
+
+        await state.set_state(self.Voting.choosing_option)
+
+    async def fetch_poll_by_title(self, title):
+        async with self.pool.acquire() as conn:
+            try:
+                return await conn.fetchrow("SELECT * FROM polls WHERE title ILIKE $1", title)
+            except Exception as e:
+                print(f"Error fetching poll by title: {e}")
+                return None
 
     async def fetch_poll_options(self, poll_id):
         async with self.pool.acquire() as conn:
@@ -585,11 +639,10 @@ class bothandler:
 
     async def handle_statistika(self, message: types.Message):
         logger.log_message(message)
-        user_id = message.from_user.id  # Получаем ID текущего пользователя
+        user_id = message.from_user.id  # Get current user ID
 
         async with self.pool.acquire() as conn:
             try:
-                # Получаем список всех голосований с дополнительной логикой для фильтрации приватных
                 all_polls = await conn.fetch(
                     """
                     SELECT
@@ -642,7 +695,6 @@ class bothandler:
                     polls_stats[poll_id]["votes"] += votes
                     polls_stats[poll_id]["options"][option] = votes
 
-                # Отправляем каждую статистику голосования в отдельном сообщении
                 for poll_id, stats in polls_stats.items():
                     options_stats = stats["options"]
                     total_votes = stats["votes"]
@@ -662,7 +714,7 @@ class bothandler:
                         f"{''.join([s + '\n' for s in option_strings])}\n"
                     )
 
-                    await self.send_long_message(message, response)  # Отправляем сообщение для каждого голосования
+                    await self.send_long_message(message, response)  # Send stats
 
             except Exception as e:
                 await message.answer(f"Ошибка при получении статистики: {e}")
@@ -814,12 +866,12 @@ class bothandler:
         await self.update_archived_polls()
 
     async def update_active_polls(self):
+        # находит все активные, которые уже должны быть завершены
         async with self.pool.acquire() as conn:
             try:
-                active_polls = await conn.fetch("SELECT * FROM polls WHERE is_active = TRUE AND end_time > NOW()")
-                for poll in active_polls:
-                    # Обновляем информацию о голосовании в БД
-                    await conn.execute("UPDATE polls SET last_updated = NOW() WHERE id = $1", poll['id'])
+                expired_polls = await conn.fetch("SELECT id FROM polls WHERE is_active = TRUE AND end_time <= NOW()")
+                for poll in expired_polls:
+                    await self.end_poll(poll['id'])
             except Exception as e:
                 print(f"Error updating active polls: {e}")
 
@@ -852,11 +904,21 @@ class bothandler:
         for part in parts:
             await message.answer(part)
 
+    async def handle_data_type_input(self, message: types.Message, state: FSMContext):
+        if message.text not in ["Числовой", "Строчный"]:
+            await message.answer("Пожалуйста, выберите 'Числовой' или 'Строчный'.")
+            return
+        
+        await state.update_data(data_type=message.text)
+
+        await message.answer("Введите название голосования:", reply_markup=keyboard.get_cancel_keyboard())
+        await state.set_state(self.PollCreation.waiting_for_title)
+
     async def run(self): 
         await self.init_db()
         print("🟢 Бот запущен и начал логирование...")
+        asyncio.create_task(self.update_polls())
         try:
             await self.dp.start_polling(self.bot)
-            self.dp.loop.create_task(self.update_polls())
         finally:
             await self.close_db()
