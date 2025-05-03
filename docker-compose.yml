@@ -15,6 +15,22 @@ services:
       - "5432:5432"
     volumes:
       - botdb-data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    <<: [*env]
+    build:
+      context: ./voting-bot
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
 
 
 volumes:
