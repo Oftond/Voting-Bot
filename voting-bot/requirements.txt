@@ -1,6 +1,6 @@
-aiogram
-asyncio
-asyncpg
-dotenv
-sqlalchemy
-alembic
+aiogram==3.20.0.post0
+asyncio==3.4.3
+asyncpg==0.30.0
+dotenv==0.9.9
+sqlalchemy==2.0.40
+alembic==1.15.2
